@@ -1,31 +1,63 @@
 package com.personal.gpscopy
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
+import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 /**
- * The entire UI: a single status line. No history, maps, logs, accounts, etc.
- * Its only job is to request the permissions the background trigger needs.
+ * Minimal UI:
+ *   - A single status line (Monitoring: Active / Inactive).
+ *   - The current coordinate in the exact "lat,lng" format.
+ *   - A COPY button so the user can copy straight from inside the app.
+ *
+ * It also requests the permissions the background trigger needs and fetches a
+ * fresh fix whenever it is opened (so opening the app behaves like the GPS-ON
+ * trigger).
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
+    private lateinit var coordinateText: TextView
+    private lateinit var copyButton: Button
+    private lateinit var refreshButton: Button
+
+    private var currentCoordinate: String? = null
 
     private val permissionLauncher =
         registerForActivityResult(
             androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
-        ) { updateStatus() }
+        ) {
+            updateStatus()
+            maybeFetch()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
         statusText = findViewById(R.id.statusText)
+        coordinateText = findViewById(R.id.coordinateText)
+        copyButton = findViewById(R.id.copyButton)
+        refreshButton = findViewById(R.id.refreshButton)
+
+        copyButton.setOnClickListener {
+            val coord = currentCoordinate
+            if (!coord.isNullOrEmpty()) {
+                ClipboardUtils.copy(this, coord)
+                ClipboardUtils.toast(this, "Copied")
+                ClipboardUtils.lightVibrate(this)
+            }
+        }
+
+        refreshButton.setOnClickListener { maybeFetch() }
 
         NotificationHelper.ensureChannel(this)
         requestNeededPermissions()
@@ -34,6 +66,48 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateStatus()
+        // Show the last known coordinate immediately if we already have one.
+        LocationStore(this).currentCoordinate?.let { showCoordinate(it) }
+        maybeFetch()
+    }
+
+    /** Fetch a fresh fix for the in-app display when location is enabled + permitted. */
+    private fun maybeFetch() {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) return
+        if (!isLocationEnabled()) {
+            coordinateText.text = "Turn on GPS / Location"
+            return
+        }
+
+        coordinateText.text = "Getting location..."
+        copyButton.isEnabled = false
+
+        // showNotification = false: opening the app should NOT push a status-bar
+        // notification; it just shows the coordinate inside the screen.
+        LocationFetcher.fetch(
+            context = this,
+            showNotification = false,
+            onResult = { result ->
+                runOnUiThread {
+                    when (result) {
+                        is LocationFetcher.FetchResult.Acquiring ->
+                            coordinateText.text = "Getting location..."
+                        is LocationFetcher.FetchResult.Success ->
+                            showCoordinate(result.coordinate)
+                        is LocationFetcher.FetchResult.Failed ->
+                            if (currentCoordinate == null) {
+                                coordinateText.text = "Location unavailable"
+                            }
+                    }
+                }
+            }
+        )
+    }
+
+    private fun showCoordinate(coordinate: String) {
+        currentCoordinate = coordinate
+        coordinateText.text = coordinate
+        copyButton.isEnabled = true
     }
 
     private fun requestNeededPermissions() {
@@ -80,6 +154,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         updateStatus()
+        maybeFetch()
     }
 
     private fun updateStatus() {
@@ -88,6 +163,16 @@ class MainActivity : AppCompatActivity() {
 
         // Once foreground location is granted, nudge for "Allow all the time".
         if (active) maybeRequestBackgroundLocation()
+    }
+
+    private fun isLocationEnabled(): Boolean {
+        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lm.isLocationEnabled
+        } else {
+            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }
     }
 
     private fun hasPermission(permission: String): Boolean =
