@@ -20,25 +20,43 @@ import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
 
 /**
- * One-shot location fetch. Replaces the old foreground LocationService so the
- * whole flow can run from a background broadcast without hitting the Android 12+
- * "cannot start FGS from background" restriction.
+ * One-shot location fetch. Used by:
+ *   - ProvidersChangedReceiver (background, GPS-ON trigger -> posts notification)
+ *   - MainActivity              (foreground, shows the coordinate inside the app)
  *
  * Lifecycle:
- *   1. Post the "Getting location..." placeholder notification immediately.
+ *   1. Report Acquiring + (optionally) post the "Getting location..." notification.
  *   2. Request ONE fresh high-accuracy fix (rejects stale cached results).
  *   3. If no fresh fix arrives within the soft timeout, fall back to the last
  *      known location so the user still gets a coordinate.
- *   4. Validate -> format -> dedupe -> replace notification + arm 10-min alarm.
+ *   4. Validate -> format -> dedupe -> report Success + replace notification + arm 10-min alarm.
  *   5. Call onComplete() so the receiver can release goAsync().
- *
- * The soft timeout is kept under the ~10s BroadcastReceiver budget on purpose.
  */
 object LocationFetcher {
 
     private const val TAG = "LocationFetcher"
 
-    fun fetch(context: Context, onComplete: () -> Unit) {
+    /** Progress/result reported back to whoever started the fetch (e.g. the UI). */
+    sealed interface FetchResult {
+        /** Waiting for the first valid fix. */
+        object Acquiring : FetchResult
+        /** A valid coordinate string in the exact "lat,lng" format. */
+        data class Success(val coordinate: String) : FetchResult
+        /** No usable fix could be obtained. */
+        object Failed : FetchResult
+    }
+
+    /**
+     * @param showNotification post / update the status-bar notification.
+     * @param onResult         progress + result callback, invoked on the main thread.
+     * @param onComplete       called exactly once when the fetch is fully finished.
+     */
+    fun fetch(
+        context: Context,
+        showNotification: Boolean = true,
+        onResult: ((FetchResult) -> Unit)? = null,
+        onComplete: () -> Unit = {}
+    ) {
         val appCtx = context.applicationContext
 
         if (ContextCompat.checkSelfPermission(
@@ -46,6 +64,7 @@ object LocationFetcher {
             ) != PackageManager.PERMISSION_GRANTED
         ) {
             Log.w(TAG, "No location permission; aborting.")
+            onResult?.invoke(FetchResult.Failed)
             onComplete()
             return
         }
@@ -57,14 +76,19 @@ object LocationFetcher {
         val handler = Handler(Looper.getMainLooper())
         var done = false
 
+        // We're waiting for the first valid fix.
+        onResult?.invoke(FetchResult.Acquiring)
+
         // Show the placeholder right away (no-op on Android 13+ without permission).
-        store.notificationActive = true
-        try {
-            notifications.notify(
-                Constants.NOTIFICATION_ID,
-                NotificationHelper.buildGettingLocation(appCtx)
-            )
-        } catch (_: SecurityException) {
+        if (showNotification) {
+            store.notificationActive = true
+            try {
+                notifications.notify(
+                    Constants.NOTIFICATION_ID,
+                    NotificationHelper.buildGettingLocation(appCtx)
+                )
+            } catch (_: SecurityException) {
+            }
         }
 
         fun complete() {
@@ -86,38 +110,35 @@ object LocationFetcher {
             if (bad) {
                 Log.w(TAG, "Rejected fix (null/low-accuracy).")
                 // Nothing valid to show yet -> take the placeholder down.
-                if (store.currentCoordinate == null) {
+                if (showNotification && store.currentCoordinate == null) {
                     store.notificationActive = false
                     notifications.cancel(Constants.NOTIFICATION_ID)
                 }
+                onResult?.invoke(FetchResult.Failed)
                 complete()
                 return
             }
 
             val coordinate = CoordinateFormatter.format(location!!.latitude, location.longitude)
 
-            // Duplicate suppression: same coordinate AND a notification is already up.
-            if (coordinate == store.lastCoordinate && store.notificationActive &&
-                store.currentCoordinate != null
-            ) {
-                Log.d(TAG, "Duplicate coordinate; keeping existing notification.")
-                complete()
-                return
-            }
-
             store.currentCoordinate = coordinate
             store.lastCoordinate = coordinate
-            store.notificationActive = true
 
-            try {
-                notifications.notify(
-                    Constants.NOTIFICATION_ID,
-                    NotificationHelper.buildCoordinate(appCtx, coordinate)
-                )
-            } catch (_: SecurityException) {
+            // Always report the coordinate to the UI, even if it's a duplicate.
+            onResult?.invoke(FetchResult.Success(coordinate))
+
+            if (showNotification) {
+                store.notificationActive = true
+                try {
+                    notifications.notify(
+                        Constants.NOTIFICATION_ID,
+                        NotificationHelper.buildCoordinate(appCtx, coordinate)
+                    )
+                } catch (_: SecurityException) {
+                }
+                scheduleAutoCopy(appCtx, coordinate)
             }
 
-            scheduleAutoCopy(appCtx, coordinate)
             complete()
         }
 
@@ -170,4 +191,3 @@ object LocationFetcher {
         am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pending)
     }
 }
-
